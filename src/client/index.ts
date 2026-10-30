@@ -3,10 +3,13 @@
  * macOS 三态工作台：分栏伴生 / 宽幅工作台 / 极致沉浸
  *
  * 实现要点：
- * - 选择器锚定 DSH CSS Module 哈希格式 `xxxxx_<name>`，用 `_name` 前缀避免子串误命中
- * - 只跟踪 frame 自身的三个 data 属性（collapsed/animating/dragging），不扫子树
- * - ResizeObserver 仅作为"需要重测"的信号，统一经 measure() 单点写入 CSS 变量
- * - 卸载时还原所有 DOM 副作用（attribute + CSS 变量 + observer）
+ * - 选择器只用 DSH 宿主渲染的 data 属性（data-shell-* / data-rightbar-col / data-sidebar-right-*），
+ *   不按 CSS Module 类名子串匹配
+ * - 侧栏宽度直接取 frame 内联 gridTemplateColumns 的第一列（宿主 computeColumns 的结果），
+ *   不测量 DOM；折叠时宿主在 darwin 上写 0px
+ * - 顶栏避让沿用宿主的 --dsh-frame-leading-clearance（窗口化 160px / 原生全屏 84px）
+ * - 不改左侧栏层级：面板宽度已限制为 100vw - 侧栏宽度，二者不重叠
+ * - 卸载时还原所有 DOM 副作用（样式 + CSS 变量 + observer）
  */
 
 // ---------------------------------------------------------------------------
@@ -15,33 +18,34 @@
 
 const STYLE_ID = '@kewen/dsh-sidebar-plus-style'
 
-/** 插件自定义 CSS 变量与属性名（写入 documentElement） */
+/** 插件自定义 CSS 变量（写入 documentElement） */
 const WIDTH_VAR = '--dsh-active-sidebar-width'
-const COLLAPSED_ATTR = 'data-dsh-sidebar-collapsed'
 
-/** DSH 侧栏初始宽度（与 layoutInfo.sidebar 默认值一致） */
+/** DSH 侧栏初始宽度（与 layoutInfo.sidebar 默认值一致），仅作 JS 写入前的回退 */
 const DSH_SIDEBAR_DEFAULT_PX = 280
-/** 低于此宽度视为侧栏不可见，不写入变量 */
-const SIDEBAR_MIN_WIDTH_PX = 50
 
-/** CSS Module 选择器：DSH 哈希前缀都是 `xxxxx_<name>`，用 `_name` 精确匹配 */
+/**
+ * 选择器全部锚定宿主 data 属性：
+ * - frame：AppFrame 根节点，唯一带 [data-shell-overlay] 直接子节点的元素
+ * - center：紧邻 [data-rightbar-col] 之前的列（CenterColumn）
+ */
 const SEL = {
-  frame: '[class*="_frame"]',
-  sidebar: '[class*="_sidebarCol"]',
-  center: '[class*="_centerCol"]',
-  leading: '[class*="_leadingSeat"]',
-  /** 专属 data 属性锁定，无需 class 匹配 */
+  frame: ':has(> [data-shell-overlay])',
+  overlay: '[data-shell-overlay]',
+  center: ':has(+ [data-rightbar-col])',
+  leading: '[data-shell-leading]',
   session: '[data-sidebar-right-session]:not([hidden])',
   panel: '[data-sidebar-right-panel="fullscreen"]',
 } as const
 
-/** dockkit column-0 的 inline-start 避让值（px），与 DSH 原生默认对齐 */
-const STRIP_INLINE_START = {
-  /** 侧栏展开：交通灯在侧栏上方，右面板无需避让 */
-  sidebarExpanded: 10,
-  /** 侧栏折叠 + macOS 原生全屏：交通灯隐藏，leadingSeat left:12px，容纳展开按钮 */
-  sidebarCollapsedNativeFullscreen: 48,
-} as const
+/** 侧栏展开时 dockkit column-0 的 inline-start（交通灯在侧栏上方，无需避让） */
+const STRIP_INLINE_START_EXPANDED_PX = 10
+
+/**
+ * 侧栏折叠且右面板全屏时，左上角按钮（宿主 z-index 15）会被 Tab 栏（dock layer 40）盖住。
+ * 只在这一状态下抬到 41：高于 Tab 栏，低于浮动窗（float layer 60）。
+ */
+const LEADING_LAYER_OVER_FULLSCREEN = 41
 
 // ---------------------------------------------------------------------------
 // CSS 注入
@@ -58,53 +62,49 @@ function injectSidebarPlusStyles(): () => void {
     document.head.appendChild(style)
   }
 
-  style.textContent = `
-/* ========== 1. 层级：左侧栏 + 左上浮动按钮不被全屏面板遮挡 ========== */
-[data-platform="darwin"] ${SEL.sidebar} {
-  position: relative;
-  z-index: 50;
-}
-[data-platform="darwin"] ${SEL.leading} {
-  z-index: 60 !important;
-  pointer-events: auto !important;
-}
+  const D = '[data-platform="darwin"]'
+  const F = `${D} ${SEL.frame}`
+  const P = `${SEL.session} ${SEL.panel}`
+  const COL0 = '[data-dockkit-host="dock"][data-dockkit-column="0"]'
 
-/* ========== 2. 遮罩：前台活跃会话全屏时隐藏底层聊天流 ========== */
-[data-platform="darwin"] ${SEL.frame}[data-rightbar-fullscreen]:has(${SEL.session} ${SEL.panel}) ${SEL.center} {
+  style.textContent = `
+/* ========== 1. 遮罩：前台活跃会话全屏时隐藏底层聊天流 ========== */
+${F}[data-rightbar-fullscreen]:has(${P}) > ${SEL.center} {
   visibility: hidden !important;
   transition: visibility 0s linear var(--ds-transition-duration-slow, 0.3s) !important;
 }
 
-/* ========== 3. 布局：态2 / 态3 ========== */
-/* 基准：靠右对齐，与原生网格动画同频 */
-[data-platform="darwin"] ${SEL.session} ${SEL.panel} {
-  left: auto !important;
-  right: 0 !important;
-  transition: max-width var(--ds-transition-duration-slow, 0.22s) var(--ds-ease-in-out, cubic-bezier(0.16, 1, 0.3, 1)) !important;
-}
-/* 态2：侧栏展开 → 右面板宽度 = 100vw - 侧栏宽度 */
-[data-platform="darwin"] ${SEL.frame}:not([data-sidebar-collapsed]) ${SEL.session} ${SEL.panel} {
+/* ========== 2. 布局：全屏面板让出左侧栏 ========== */
+/* 宿主在 darwin 上折叠时侧栏列为 0px，同一条规则覆盖态2 / 态3 */
+${F} ${P} {
   max-width: calc(100vw - var(${WIDTH_VAR}, ${DSH_SIDEBAR_DEFAULT_PX}px)) !important;
+  transition: max-width var(--ds-transition-duration-slow, 0.3s) var(--ds-ease-in-out, ease-in-out) !important;
 }
-/* 态3：侧栏折叠 → 100% 满屏 */
-[data-platform="darwin"] ${SEL.frame}[data-sidebar-collapsed] ${SEL.session} ${SEL.panel} {
-  max-width: 100vw !important;
+/* 拖拽侧栏时宿主关闭了网格过渡，面板同步跟手 */
+${F}[data-dragging] ${P} {
+  transition: none !important;
 }
 
-/* ========== 4. Chrome 微调：dockkit column-0 的 inline-start 避让 ========== */
-/* 侧栏展开（窗口化或原生全屏）：交通灯在侧栏上方，右面板无需避让 */
-[data-platform="darwin"] ${SEL.frame}:not([data-sidebar-collapsed]) ${SEL.session} ${SEL.panel} [data-dockkit-host="dock"][data-dockkit-column="0"] {
-  --dsh-dockkit-strip-inline-start: ${STRIP_INLINE_START.sidebarExpanded}px !important;
+/* ========== 3. Chrome：dockkit column-0 的 inline-start 避让 ========== */
+/* 侧栏展开：交通灯在侧栏上方，无需避让 */
+${F}:not([data-sidebar-collapsed]) ${P} ${COL0} {
+  --dsh-dockkit-strip-inline-start: ${STRIP_INLINE_START_EXPANDED_PX}px !important;
 }
-/* 侧栏折叠 + macOS 原生全屏：交通灯隐藏，leadingSeat left:12px，容纳展开按钮 */
-html[data-platform="darwin"][data-fullscreen] ${SEL.frame}[data-sidebar-collapsed] ${SEL.session} ${SEL.panel} [data-dockkit-host="dock"][data-dockkit-column="0"] {
-  --dsh-dockkit-strip-inline-start: ${STRIP_INLINE_START.sidebarCollapsedNativeFullscreen}px !important;
+/* 侧栏折叠：让出交通灯 + 左上角按钮。基于宿主避让值（窗口化 160px / 原生全屏 84px），
+   再加 Tab 栏原生的 10px 间距：窗口化按钮占 88–164px，单用 160px 会压住 4px */
+${F}[data-sidebar-collapsed] ${P} ${COL0} {
+  --dsh-dockkit-strip-inline-start: calc(var(--dsh-frame-leading-clearance, 160px) + ${STRIP_INLINE_START_EXPANDED_PX}px) !important;
 }
-/* 注：侧栏折叠 + 窗口化（非原生全屏）沿用原生 88px，无需覆盖 */
+
+/* ========== 4. 层级：折叠 + 全屏时左上角按钮不被 Tab 栏盖住 ========== */
+/* 全屏时宿主 dock layer 为 40；按钮抬到 41，仍低于 float layer 60 */
+${F}[data-rightbar-fullscreen]:has(${P}) > ${SEL.leading} {
+  z-index: ${LEADING_LAYER_OVER_FULLSCREEN} !important;
+}
 
 /* ========== 5. 无障碍 ========== */
 @media (prefers-reduced-motion: reduce) {
-  [data-platform="darwin"] ${SEL.panel} {
+  ${F} ${P} {
     transition: none !important;
   }
 }
@@ -116,20 +116,22 @@ html[data-platform="darwin"][data-fullscreen] ${SEL.frame}[data-sidebar-collapse
 }
 
 // ---------------------------------------------------------------------------
-// 侧栏追踪器：把"读 DOM 状态 → 写 CSS 变量"的数据流收敛到 class 字段上
-// 写入出口有两个（各自最优数据源）：
-//   - ResizeObserver 回调：免费拿到 borderBoxSize，拖拽时逐像素更新
-//   - measure()：兜底路径，用 getBoundingClientRect 处理 collapsed 属性同步和非 RO 场景
+// 侧栏宽度同步：frame 内联 gridTemplateColumns → CSS 变量
 // ---------------------------------------------------------------------------
 
-class SidebarTracker {
+/** 解析 `280px minmax(...) minmax(...)` 的第一列，失败返回 null */
+export function parseSidebarColumn(gridTemplateColumns: string): number | null {
+  const match = /^\s*(\d+(?:\.\d+)?)px\b/.exec(gridTemplateColumns)
+  return match ? Number(match[1]) : null
+}
+
+class SidebarWidthSync {
   private readonly root: HTMLElement
-  private rafId: number | null = null
-  private frameEl: Element | null = null
-  private sidebarEl: Element | null = null
-  private lastCollapsed: boolean | null = null
-  private resizeObserver: ResizeObserver | null = null
+  private frameEl: HTMLElement | null = null
+  private lastWidth: number | null = null
+  /** 监听 frame 的 style（宿主每次重算列宽都会改写内联 gridTemplateColumns） */
   private frameObserver: MutationObserver | null = null
+  /** 已绑定时只看 frame 父节点的直接子节点，未绑定时看整棵树 */
   private probeObserver: MutationObserver | null = null
   private disposed = false
 
@@ -138,135 +140,68 @@ class SidebarTracker {
   }
 
   start(): void {
-    this.attachResizeObserver()
-    this.schedule()
-    this.bindObservers()
+    if (typeof MutationObserver === 'undefined') return
+    this.bind()
   }
 
   dispose(): void {
     this.disposed = true
-    if (this.rafId !== null) cancelAnimationFrame(this.rafId)
-    this.resizeObserver?.disconnect()
     this.frameObserver?.disconnect()
     this.probeObserver?.disconnect()
-    this.sidebarEl = null
+    this.frameObserver = null
+    this.probeObserver = null
     this.frameEl = null
-    // 还原写入的 DOM 状态
-    this.root.removeAttribute(COLLAPSED_ATTR)
     this.root.style.removeProperty(WIDTH_VAR)
   }
 
-  // ----- 读取：frame 三态标记 -----
-
-  private readFrameState() {
-    if (!this.frameEl || !this.frameEl.isConnected) {
-      this.frameEl = document.querySelector(SEL.frame)
-    }
-    if (!this.frameEl) {
-      return { collapsed: false, animating: false, dragging: false }
-    }
-    return {
-      collapsed: this.frameEl.hasAttribute('data-sidebar-collapsed'),
-      animating: this.frameEl.hasAttribute('data-animating'),
-      dragging: this.frameEl.hasAttribute('data-dragging'),
-    }
+  private findFrame(): HTMLElement | null {
+    return document.querySelector<HTMLElement>(SEL.overlay)?.parentElement ?? null
   }
 
-  // ----- 写入：CSS 变量 / 属性（单点出口） -----
-
-  private setCollapsedAttr(collapsed: boolean): void {
-    if (this.lastCollapsed === collapsed) return
-    this.lastCollapsed = collapsed
-    this.root.setAttribute(COLLAPSED_ATTR, collapsed ? 'true' : 'false')
+  private sync = (): void => {
+    if (this.disposed || !this.frameEl) return
+    const width = parseSidebarColumn(this.frameEl.style.gridTemplateColumns)
+    if (width === null || width === this.lastWidth) return
+    this.lastWidth = width
+    this.root.style.setProperty(WIDTH_VAR, `${Math.round(width)}px`)
   }
 
-  private setSidebarWidth(widthPx: number): void {
-    this.root.style.setProperty(WIDTH_VAR, `${Math.round(widthPx)}px`)
-  }
-
-  // ----- 核心：测量并把状态同步到 CSS -----
-
-  private measure = (): void => {
+  private bind = (): void => {
     if (this.disposed) return
-    const { collapsed, animating, dragging } = this.readFrameState()
-    this.setCollapsedAttr(collapsed)
+    if (this.frameEl?.isConnected) return
+    const frame = this.findFrame()
 
-    // 动画期间不写中间宽度，避免与 CSS grid transition 打架
-    if (collapsed || (animating && !dragging)) return
-
-    const sidebarEl = this.sidebarEl?.isConnected ? this.sidebarEl : document.querySelector(SEL.sidebar)
-    if (!sidebarEl) return
-    const width = sidebarEl.getBoundingClientRect().width
-    if (width > SIDEBAR_MIN_WIDTH_PX) this.setSidebarWidth(width)
-  }
-
-  private schedule = (): void => {
-    if (this.rafId !== null || this.disposed) return
-    this.rafId = requestAnimationFrame(() => {
-      this.rafId = null
-      this.measure()
-    })
-  }
-
-  // ----- 元素绑定 -----
-
-  private attachResizeObserver = (): void => {
-    if (typeof ResizeObserver === 'undefined') return
-    const el = document.querySelector(SEL.sidebar)
-    if (!el || el === this.sidebarEl) return
-    this.resizeObserver?.disconnect()
-    this.sidebarEl = el
-    // RO 的 entry 自带免费测量值，避免 getBoundingClientRect 的强制 layout；
-    // collapsed / animating 时跳过写变量，但不影响 collapsed 属性的同步（由 measure 负责）
-    this.resizeObserver = new ResizeObserver((entries) => {
-      const { collapsed, animating, dragging } = this.readFrameState()
-      if (collapsed || (animating && !dragging)) return
-      for (const entry of entries) {
-        const width = entry.borderBoxSize?.[0]?.inlineSize ?? entry.contentRect.width
-        if (width > SIDEBAR_MIN_WIDTH_PX) this.setSidebarWidth(width)
-      }
-    })
-    this.resizeObserver.observe(el)
-    // 同步跑一次，让变量立刻落地，避免 CSS fallback 闪烁
-    this.measure()
-  }
-
-  private bindFrame = (): void => {
-    const el = document.querySelector(SEL.frame)
-    if (!el || el === this.frameEl) return
     this.frameObserver?.disconnect()
-    this.frameEl = el
-    this.frameObserver = new MutationObserver(this.schedule)
-    this.frameObserver.observe(el, {
-      attributes: true,
-      attributeFilter: ['data-sidebar-collapsed', 'data-animating', 'data-dragging'],
-    })
-  }
+    this.probeObserver?.disconnect()
+    this.frameObserver = null
+    this.frameEl = frame
 
-  private bindAll = (): void => {
-    this.bindFrame()
-    this.attachResizeObserver()
-  }
+    if (!frame) {
+      // 还没渲染：等任意子树变化后重试
+      this.probeObserver = new MutationObserver(this.bind)
+      this.probeObserver.observe(this.root, { childList: true, subtree: true })
+      return
+    }
 
-  private bindObservers(): void {
-    if (typeof MutationObserver === 'undefined') return
-    this.bindAll()
-    // probe 长驻，仅在 frame/sidebar 首次出现或换绑时工作；只 querySelector，不写 DOM
-    this.probeObserver = new MutationObserver(this.bindAll)
-    this.probeObserver.observe(this.root, { childList: true, subtree: true })
+    this.frameObserver = new MutationObserver(this.sync)
+    this.frameObserver.observe(frame, { attributes: true, attributeFilter: ['style'] })
+    // frame 被替换时，其父节点的直接子节点会变化
+    this.probeObserver = new MutationObserver(this.bind)
+    this.probeObserver.observe(frame.parentNode ?? this.root, { childList: true })
+    this.sync()
   }
 }
 
-function setupSidebarTracker(): () => void {
+function setupSidebarWidthSync(): () => void {
   if (typeof window === 'undefined' || typeof document === 'undefined') return () => {}
 
   const root = document.documentElement
-  // 非 macOS 桌面端不需要任何测量——CSS 也全部限定 darwin，直接短路
+  // 非 macOS 桌面端不需要同步——CSS 也全部限定 darwin，直接短路
   if (root.dataset.platform !== 'darwin') return () => {}
 
-  const tracker = new SidebarTracker(root)
-  tracker.start()
-  return () => tracker.dispose()
+  const sync = new SidebarWidthSync(root)
+  sync.start()
+  return () => sync.dispose()
 }
 
 // ---------------------------------------------------------------------------
@@ -281,6 +216,8 @@ interface PluginContext {
   effect: PluginEffectHandle
 }
 
+// apply 里不直接使用 ctx.sidebarRight；inject 它是为了等右侧栏服务就绪后才 apply，
+// 右侧栏缺席时本插件不生效（全部样式都作用在右侧栏 DOM 上），不要改成空数组。
 export const inject = [
   'sidebarRight',
 ]
@@ -289,10 +226,10 @@ export function apply(ctx: PluginContext): void {
   try {
     ctx.effect(() => {
       const cleanupStyles = injectSidebarPlusStyles()
-      const cleanupTracker = setupSidebarTracker()
+      const cleanupSync = setupSidebarWidthSync()
       return () => {
         cleanupStyles()
-        cleanupTracker()
+        cleanupSync()
       }
     }, 'sidebar-plus: core layout effect')
   } catch (e) {
