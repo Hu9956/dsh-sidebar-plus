@@ -13,9 +13,19 @@
     "skipLibCheck": true,
     "noEmit": true,
     "allowImportingTsExtensions": true,
-    "esModuleInterop": true
+    "esModuleInterop": true,
+    "typeRoots": [
+      "./node_modules/@types",
+      "../dsh-harness-plus/node_modules/@types"
+    ],
+    "types": ["node"],
+    "paths": {
+      "@kewen/dsh-ui": ["../packages/dsh-ui/src/index.ts"],
+      "@kewen/dsh-ui/*": ["../packages/dsh-ui/src/*"]
+    }
   },
   "include": [
-    "src"
+    "src",
+    "tests"
   ]
 }

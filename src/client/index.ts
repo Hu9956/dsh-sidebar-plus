@@ -8,18 +8,22 @@
  * - 侧栏宽度直接取 frame 内联 gridTemplateColumns 的第一列（宿主 computeColumns 的结果），
  *   不测量 DOM；折叠时宿主在 darwin 上写 0px
  * - 顶栏避让沿用宿主的 --dsh-frame-leading-clearance（窗口化 160px / 原生全屏 84px）
- * - 不改左侧栏层级：面板宽度已限制为 100vw - 侧栏宽度，二者不重叠
- * - 卸载时还原所有 DOM 副作用（样式 + CSS 变量 + observer）
+ * - 拖拽侧栏期间通过 @kewen/dsh-ui 的 beginGlobalDrag() 挂载引用计数 html[data-dsh-dragging]，
+ *   防止右侧全屏子面板（白板 / 扩展等 iframe）吞噬拖拽指针事件
+ * - 卸载时还原所有 DOM 副作用（样式 + CSS 变量 + 拖拽护盾 + observer）
  */
+
+import { beginGlobalDrag } from '@kewen/dsh-ui/host-bridge'
+import { injectPluginStyles } from '@kewen/dsh-ui/style-sheet'
 
 // ---------------------------------------------------------------------------
 // 常量：DSH 布局契约
 // ---------------------------------------------------------------------------
 
-const STYLE_ID = '@kewen/dsh-sidebar-plus-style'
+export const STYLE_ID = '@kewen/dsh-sidebar-plus'
 
 /** 插件自定义 CSS 变量（写入 documentElement） */
-const WIDTH_VAR = '--dsh-active-sidebar-width'
+export const WIDTH_VAR = '--dsh-active-sidebar-width'
 
 /** DSH 侧栏初始宽度（与 layoutInfo.sidebar 默认值一致），仅作 JS 写入前的回退 */
 const DSH_SIDEBAR_DEFAULT_PX = 280
@@ -51,23 +55,21 @@ const LEADING_LAYER_OVER_FULLSCREEN = 41
 // CSS 注入
 // ---------------------------------------------------------------------------
 
-function injectSidebarPlusStyles(): () => void {
-  if (typeof document === 'undefined') return () => {}
+const D = '[data-platform="darwin"]'
+const F = `${D} ${SEL.frame}`
+const P = `${SEL.session} ${SEL.panel}`
+const COL0 = '[data-dockkit-host="dock"][data-dockkit-column="0"]'
 
-  let style = document.querySelector<HTMLStyleElement>(`style[data-plugin-css="${STYLE_ID}"]`)
-  if (!style) {
-    style = document.createElement('style')
-    style.dataset.plugin = '@kewen/dsh-sidebar-plus'
-    style.dataset.pluginCss = STYLE_ID
-    document.head.appendChild(style)
-  }
+export const SIDEBAR_PLUS_CSS = `
+/* ========== 0. 全局拖拽防吞指针护盾（与 beginGlobalDrag 联动，独立运行时亦生效） ========== */
+html[data-dsh-dragging],
+html[data-dsh-dragging] * {
+  user-select: none !important;
+}
+html[data-dsh-dragging] iframe {
+  pointer-events: none !important;
+}
 
-  const D = '[data-platform="darwin"]'
-  const F = `${D} ${SEL.frame}`
-  const P = `${SEL.session} ${SEL.panel}`
-  const COL0 = '[data-dockkit-host="dock"][data-dockkit-column="0"]'
-
-  style.textContent = `
 /* ========== 1. 遮罩：前台活跃会话全屏时隐藏底层聊天流 ========== */
 ${F}[data-rightbar-fullscreen]:has(${P}) > ${SEL.center} {
   visibility: hidden !important;
@@ -78,7 +80,7 @@ ${F}[data-rightbar-fullscreen]:has(${P}) > ${SEL.center} {
 /* 宿主在 darwin 上折叠时侧栏列为 0px，同一条规则覆盖态2 / 态3 */
 ${F} ${P} {
   max-width: calc(100vw - var(${WIDTH_VAR}, ${DSH_SIDEBAR_DEFAULT_PX}px)) !important;
-  transition: max-width var(--ds-transition-duration-slow, 0.3s) var(--ds-ease-in-out, ease-in-out) !important;
+  transition: max-width var(--ds-transition-duration-slow, 0.3s) var(--dsh-ease-out, var(--ds-ease-in-out, ease-in-out)) !important;
 }
 /* 拖拽侧栏时宿主关闭了网格过渡，面板同步跟手 */
 ${F}[data-dragging] ${P} {
@@ -110,13 +112,12 @@ ${F}[data-rightbar-fullscreen]:has(${P}) > ${SEL.leading} {
 }
 `
 
-  return () => {
-    style?.remove()
-  }
+export function injectSidebarPlusStyles(): () => void {
+  return injectPluginStyles(STYLE_ID, SIDEBAR_PLUS_CSS)
 }
 
 // ---------------------------------------------------------------------------
-// 侧栏宽度同步：frame 内联 gridTemplateColumns → CSS 变量
+// 侧栏宽度同步 + [data-dragging] 全局拖拽护盾：frame 内联 gridTemplateColumns → CSS 变量
 // ---------------------------------------------------------------------------
 
 /** 解析 `280px minmax(...) minmax(...)` 的第一列，失败返回 null */
@@ -125,18 +126,21 @@ export function parseSidebarColumn(gridTemplateColumns: string): number | null {
   return match ? Number(match[1]) : null
 }
 
-class SidebarWidthSync {
+export class SidebarWidthSync {
   private readonly root: HTMLElement
+  private readonly doc: Document
   private frameEl: HTMLElement | null = null
   private lastWidth: number | null = null
-  /** 监听 frame 的 style（宿主每次重算列宽都会改写内联 gridTemplateColumns） */
+  private endDrag: (() => void) | null = null
+  /** 监听 frame 的 style 与 data-dragging（重算列宽 + 拖拽期间屏蔽子 iframe 吞指针） */
   private frameObserver: MutationObserver | null = null
   /** 已绑定时只看 frame 父节点的直接子节点，未绑定时看整棵树 */
   private probeObserver: MutationObserver | null = null
   private disposed = false
 
-  constructor(root: HTMLElement) {
+  constructor(root: HTMLElement, doc?: Document) {
     this.root = root
+    this.doc = doc ?? root.ownerDocument ?? document
   }
 
   start(): void {
@@ -146,6 +150,7 @@ class SidebarWidthSync {
 
   dispose(): void {
     this.disposed = true
+    this.releaseDrag()
     this.frameObserver?.disconnect()
     this.probeObserver?.disconnect()
     this.frameObserver = null
@@ -154,12 +159,27 @@ class SidebarWidthSync {
     this.root.style.removeProperty(WIDTH_VAR)
   }
 
+  private releaseDrag(): void {
+    if (this.endDrag !== null) {
+      const stop = this.endDrag
+      this.endDrag = null
+      stop()
+    }
+  }
+
   private findFrame(): HTMLElement | null {
-    return document.querySelector<HTMLElement>(SEL.overlay)?.parentElement ?? null
+    return this.doc.querySelector<HTMLElement>(SEL.overlay)?.parentElement ?? null
   }
 
   private sync = (): void => {
     if (this.disposed || !this.frameEl) return
+    if (this.frameEl.hasAttribute('data-dragging')) {
+      if (this.endDrag === null) {
+        this.endDrag = beginGlobalDrag(this.doc)
+      }
+    } else {
+      this.releaseDrag()
+    }
     const width = parseSidebarColumn(this.frameEl.style.gridTemplateColumns)
     if (width === null || width === this.lastWidth) return
     this.lastWidth = width
@@ -177,6 +197,7 @@ class SidebarWidthSync {
     this.frameEl = frame
 
     if (!frame) {
+      this.releaseDrag()
       // 还没渲染：等任意子树变化后重试
       this.probeObserver = new MutationObserver(this.bind)
       this.probeObserver.observe(this.root, { childList: true, subtree: true })
@@ -184,7 +205,7 @@ class SidebarWidthSync {
     }
 
     this.frameObserver = new MutationObserver(this.sync)
-    this.frameObserver.observe(frame, { attributes: true, attributeFilter: ['style'] })
+    this.frameObserver.observe(frame, { attributes: true, attributeFilter: ['style', 'data-dragging'] })
     // frame 被替换时，其父节点的直接子节点会变化
     this.probeObserver = new MutationObserver(this.bind)
     this.probeObserver.observe(frame.parentNode ?? this.root, { childList: true })
@@ -199,7 +220,7 @@ function setupSidebarWidthSync(): () => void {
   // 非 macOS 桌面端不需要同步——CSS 也全部限定 darwin，直接短路
   if (root.dataset.platform !== 'darwin') return () => {}
 
-  const sync = new SidebarWidthSync(root)
+  const sync = new SidebarWidthSync(root, document)
   sync.start()
   return () => sync.dispose()
 }
@@ -212,7 +233,7 @@ interface PluginEffectHandle {
   (run: () => () => void, label?: string): void
 }
 
-interface PluginContext {
+export interface PluginContext {
   effect: PluginEffectHandle
 }
 
